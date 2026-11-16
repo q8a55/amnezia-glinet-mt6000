@@ -5,23 +5,71 @@ on:
   workflow_dispatch:
     inputs:
       stock_wireguard_url:
-        description: "Optional URL to stock wireguard.ko from this exact Flint 2 firmware"
-        required: false
-        type: string
+        description: "Optional URL to stock wireguard.ko from this exact Flint 2 
+name: AmneziaWG ABI diagnostics
+
+on:
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+env:
+  owr_branch: "openwrt-24.10"
+  owr_commit: "bb59922007043c0a0813d62b0d9f6e801caff9df"
+  gl_version: "4.8.2"
+  gl_vermagic: "9469a6c8c449c47e503c05678ea1559d"
 
 jobs:
   inspect:
     runs-on: ubuntu-latest
     steps:
-      - name: Install inspection tools
+      - name: Checkout GL configuration
+        uses: actions/checkout@v4
+        with:
+          path: gl
+
+      - name: Checkout AmneziaWG
+        uses: actions/checkout@v4
+        with:
+          path: awg
+          repository: amnezia-vpn/amneziawg-openwrt
+
+      - name: Checkout OpenWrt
+        uses: actions/checkout@v4
+        with:
+          path: owrt
+          repository: openwrt/openwrt
+          ref: ${{ env.owr_branch }}
+          fetch-depth: 0
+
+      - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y binutils kmod
 
-      - name: Download and unpack AmneziaWG package
+      - name: Build kernel tree
+        run: |
+          set -eu
+          cd owrt
+          git reset --hard "${{ env.owr_commit }}"
+          mkdir -p package/awg
+          cp -a ../awg/. package/awg/
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          cp ../gl/config_${{ env.gl_version }}.buildinfo .config
+          echo "CONFIG_PACKAGE_kmod-amneziawg=m" >> .config
+          echo "CONFIG_PACKAGE_amneziawg-tools=y" >> .config
+          echo "CONFIG_PACKAGE_luci-proto-amneziawg=y" >> .config
+          make defconfig
+          sed -i 's/grep '\''=\[ym\]'\'' .*/echo "${{ env.gl_vermagic }}" > $(LINUX_DIR)\/.vermagic/' include/kernel-defaults.mk
+          make tools/install
+          make toolchain/install
+          make target/linux/{clean,compile} -i -j"$(nproc)" V=s
+          actual="$(cat ./build_dir/target-*/linux-*/linux-*/.vermagic)"
+          test "$actual" = "${{ env.gl_vermagic }}"
+
+      - name: Download and inspect AWG
         run: |
           set -eu
           mkdir -p work/amnezia
@@ -30,60 +78,53 @@ jobs:
           gzip -dc work/kmod-amneziawg.ipk | tar -xf - -C work/amnezia
           tar -xzf work/amnezia/control.tar.gz -C work/amnezia
           tar -xzf work/amnezia/data.tar.gz -C work/amnezia
-          find work/amnezia -name '*.ko' -print
-
-      - name: Inspect AmneziaWG module
-        run: |
-          set -eu
           MODULE="$(find work/amnezia -name amneziawg.ko -print -quit)"
           test -n "$MODULE"
+          cp "$MODULE" work/amneziawg.ko
           {
-            echo "## Package control"
+            echo "## Package"
             cat work/amnezia/control
             echo "## Module metadata"
-            modinfo "$MODULE" || true
-            echo "## ELF header"
-            readelf -h "$MODULE"
-            echo "## ELF sections"
-            readelf -SW "$MODULE"
-            echo "## Imported symbols"
-            nm -u "$MODULE" || true
-            echo "## ABI-related strings"
-            strings "$MODULE" | grep -Ei 'vermagic|depends=|srcversion|amnezia|wireguard' | head -n 200 || true
+            modinfo work/amneziawg.ko || true
+            echo "## ELF"
+            readelf -h work/amneziawg.ko
+            readelf -SW work/amneziawg.ko
+            echo "## Imports"
+            nm -u work/amneziawg.ko | awk '{print $NF}' | sort -u
           } | tee work/amnezia-report.txt
 
-      - name: Compare with stock WireGuard if supplied
-        if: ${{ inputs.stock_wireguard_url != '' }}
+      - name: Compare imports with Module.symvers
         run: |
           set -eu
-          mkdir -p work/stock
-          curl -fL --retry 3 "${{ inputs.stock_wireguard_url }}" -o work/stock/wireguard.ko
+          KERNEL="$(find owrt/build_dir -type f -name Module.symvers -print -quit)"
+          test -n "$KERNEL"
+          cp "$KERNEL" work/Module.symvers
+          nm -u work/amneziawg.ko | awk '{print $NF}' | sort -u > work/imports.txt
           {
-            echo "## Stock module metadata"
-            modinfo work/stock/wireguard.ko || true
-            echo "## Stock ELF sections"
-            readelf -SW work/stock/wireguard.ko
-            echo "## Stock imported symbols"
-            nm -u work/stock/wireguard.ko || true
-            echo "## Imported-symbol comparison"
-            diff -u <(nm -u work/stock/wireguard.ko | awk '{print $NF}' | sort -u) <(nm -u "$(find work/amnezia -name amneziawg.ko -print -quit)" | awk '{print $NF}' | sort -u) || true
-          } | tee work/stock-comparison.txt
+            echo "## OpenWrt source revision"
+            git -C owrt rev-parse HEAD
+            echo "## Kernel config"
+            find owrt/build_dir/target-* -path '*/linux-*/linux-*/.config' -type f -print -quit | while read f; do
+              grep -E '^CONFIG_(MODVERSIONS|MODULE_REL_CRCS|IKCONFIG|IKCONFIG_PROC)=' "$f" || true
+            done
+            echo "## Export records for AWG imports"
+            awk 'NR==FNR {want[$1]=1; next} ($2 in want) {print $2, $1, $3, $4}' work/imports.txt work/Module.symvers | sort -k1,1
+            echo "## Imports absent from Module.symvers"
+            awk 'NR==FNR {want[$1]=1; next} ($2 in want) {found[$2]=1} END {for (s in want) if (!(s in found)) print s}' work/imports.txt work/Module.symvers | sort
+            echo "## Limitation"
+            echo "This is the upstream OpenWrt build tree with GL vermagic overridden."
+            echo "It is not the original vendor GL.iNet Module.symvers and cannot prove live-kernel ABI compatibility."
+          } | tee work/kernel-symbol-comparison.txt
 
-      - name: Record compatibility limitation
-        if: ${{ inputs.stock_wireguard_url == '' }}
-        run: |
-          {
-            echo "No stock wireguard.ko was supplied."
-            echo "This report inspects the AmneziaWG binary but cannot prove compatibility with the live GL.iNet kernel."
-            echo "Matching vermagic alone is not proof of ABI compatibility."
-          } | tee work/stock-comparison.txt
-
-      - name: Upload diagnostic report
+      - name: Upload diagnostics
         uses: actions/upload-artifact@v4
         with:
-          name: amneziawg-abi-diagnostics
+          name: amneziawg-abi-diagnostics-v2
           path: |
+            work/amneziawg.ko
+            work/Module.symvers
             work/amnezia-report.txt
-            work/stock-comparison.txt
+            work/kernel-symbol-comparison.txt
             work/SHA256SUMS.txt
           if-no-files-found: error
+
