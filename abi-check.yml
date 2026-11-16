@@ -1,0 +1,89 @@
+
+name: AmneziaWG ABI diagnostics
+
+on:
+  workflow_dispatch:
+    inputs:
+      stock_wireguard_url:
+        description: "Optional URL to stock wireguard.ko from this exact Flint 2 firmware"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install inspection tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils kmod
+
+      - name: Download and unpack AmneziaWG package
+        run: |
+          set -eu
+          mkdir -p work/amnezia
+          curl -fL --retry 3 "https://github.com/${GITHUB_REPOSITORY}/releases/download/AneziaWG_OpenWRT_v4.8.2/kmod-amneziawg_4.8.2.ipk" -o work/kmod-amneziawg.ipk
+          sha256sum work/kmod-amneziawg.ipk | tee work/SHA256SUMS.txt
+          gzip -dc work/kmod-amneziawg.ipk | tar -xf - -C work/amnezia
+          tar -xzf work/amnezia/control.tar.gz -C work/amnezia
+          tar -xzf work/amnezia/data.tar.gz -C work/amnezia
+          find work/amnezia -name '*.ko' -print
+
+      - name: Inspect AmneziaWG module
+        run: |
+          set -eu
+          MODULE="$(find work/amnezia -name amneziawg.ko -print -quit)"
+          test -n "$MODULE"
+          {
+            echo "## Package control"
+            cat work/amnezia/control
+            echo "## Module metadata"
+            modinfo "$MODULE" || true
+            echo "## ELF header"
+            readelf -h "$MODULE"
+            echo "## ELF sections"
+            readelf -SW "$MODULE"
+            echo "## Imported symbols"
+            nm -u "$MODULE" || true
+            echo "## ABI-related strings"
+            strings "$MODULE" | grep -Ei 'vermagic|depends=|srcversion|amnezia|wireguard' | head -n 200 || true
+          } | tee work/amnezia-report.txt
+
+      - name: Compare with stock WireGuard if supplied
+        if: ${{ inputs.stock_wireguard_url != '' }}
+        run: |
+          set -eu
+          mkdir -p work/stock
+          curl -fL --retry 3 "${{ inputs.stock_wireguard_url }}" -o work/stock/wireguard.ko
+          {
+            echo "## Stock module metadata"
+            modinfo work/stock/wireguard.ko || true
+            echo "## Stock ELF sections"
+            readelf -SW work/stock/wireguard.ko
+            echo "## Stock imported symbols"
+            nm -u work/stock/wireguard.ko || true
+            echo "## Imported-symbol comparison"
+            diff -u <(nm -u work/stock/wireguard.ko | awk '{print $NF}' | sort -u) <(nm -u "$(find work/amnezia -name amneziawg.ko -print -quit)" | awk '{print $NF}' | sort -u) || true
+          } | tee work/stock-comparison.txt
+
+      - name: Record compatibility limitation
+        if: ${{ inputs.stock_wireguard_url == '' }}
+        run: |
+          {
+            echo "No stock wireguard.ko was supplied."
+            echo "This report inspects the AmneziaWG binary but cannot prove compatibility with the live GL.iNet kernel."
+            echo "Matching vermagic alone is not proof of ABI compatibility."
+          } | tee work/stock-comparison.txt
+
+      - name: Upload diagnostic report
+        uses: actions/upload-artifact@v4
+        with:
+          name: amneziawg-abi-diagnostics
+          path: |
+            work/amnezia-report.txt
+            work/stock-comparison.txt
+            work/SHA256SUMS.txt
+          if-no-files-found: error
