@@ -3,26 +3,18 @@ name: AmneziaWG ABI diagnostics
 
 on:
   workflow_dispatch:
-    inputs:
-      stock_wireguard_url:
-        description: "Optional URL to stock wireguard.ko from this exact Flint 2 
-name: AmneziaWG ABI diagnostics
-
-on:
-  workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
-  owr_branch: "openwrt-24.10"
-  owr_commit: "bb59922007043c0a0813d62b0d9f6e801caff9df"
-  gl_version: "4.8.2"
-  gl_vermagic: "9469a6c8c449c47e503c05678ea1559d"
+  owr_branch: openwrt-24.10
+  owr_commit: bb59922007043c0a0813d62b0d9f6e801caff9df
 
 jobs:
   inspect:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout GL configuration
         uses: actions/checkout@v4
@@ -48,7 +40,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y binutils kmod
 
-      - name: Build kernel tree
+      - name: Configure kernel
         run: |
           set -eu
           cd owrt
@@ -57,24 +49,25 @@ jobs:
           cp -a ../awg/. package/awg/
           ./scripts/feeds update -a
           ./scripts/feeds install -a
-          cp ../gl/config_${{ env.gl_version }}.buildinfo .config
+          cp ../gl/config_4.8.2.buildinfo .config
           echo "CONFIG_PACKAGE_kmod-amneziawg=m" >> .config
-          echo "CONFIG_PACKAGE_amneziawg-tools=y" >> .config
-          echo "CONFIG_PACKAGE_luci-proto-amneziawg=y" >> .config
           make defconfig
-          sed -i 's/grep '\''=\[ym\]'\'' .*/echo "${{ env.gl_vermagic }}" > $(LINUX_DIR)\/.vermagic/' include/kernel-defaults.mk
+
+      - name: Build kernel and generate Module.symvers
+        run: |
+          set -eu
+          cd owrt
           make tools/install
           make toolchain/install
-          make target/linux/{clean,compile} -i -j"$(nproc)" V=s
-          actual="$(cat ./build_dir/target-*/linux-*/linux-*/.vermagic)"
-          test "$actual" = "${{ env.gl_vermagic }}"
+          make target/linux/compile -j"$(nproc)" V=s
+          find build_dir -name Module.symvers -type f -print
 
-      - name: Download and inspect AWG
+      - name: Extract AWG module
         run: |
           set -eu
           mkdir -p work/amnezia
           curl -fL --retry 3 "https://github.com/${GITHUB_REPOSITORY}/releases/download/AneziaWG_OpenWRT_v4.8.2/kmod-amneziawg_4.8.2.ipk" -o work/kmod-amneziawg.ipk
-          sha256sum work/kmod-amneziawg.ipk | tee work/SHA256SUMS.txt
+          sha256sum work/kmod-amneziawg.ipk > work/SHA256SUMS.txt
           gzip -dc work/kmod-amneziawg.ipk | tar -xf - -C work/amnezia
           tar -xzf work/amnezia/control.tar.gz -C work/amnezia
           tar -xzf work/amnezia/data.tar.gz -C work/amnezia
@@ -82,39 +75,38 @@ jobs:
           test -n "$MODULE"
           cp "$MODULE" work/amneziawg.ko
           {
-            echo "## Package"
-            cat work/amnezia/control
-            echo "## Module metadata"
+            echo "=== MODULE INFO ==="
             modinfo work/amneziawg.ko || true
-            echo "## ELF"
+            echo "=== ELF HEADER ==="
             readelf -h work/amneziawg.ko
+            echo "=== ELF SECTIONS ==="
             readelf -SW work/amneziawg.ko
-            echo "## Imports"
+            echo "=== IMPORTED SYMBOLS ==="
             nm -u work/amneziawg.ko | awk '{print $NF}' | sort -u
-          } | tee work/amnezia-report.txt
+          } > work/amnezia-report.txt
 
       - name: Compare imports with Module.symvers
         run: |
           set -eu
-          KERNEL="$(find owrt/build_dir -type f -name Module.symvers -print -quit)"
+          KERNEL="$(find owrt/build_dir -path '*/linux-*/linux-*/Module.symvers' -type f -print -quit)"
           test -n "$KERNEL"
           cp "$KERNEL" work/Module.symvers
           nm -u work/amneziawg.ko | awk '{print $NF}' | sort -u > work/imports.txt
           {
-            echo "## OpenWrt source revision"
+            echo "=== KERNEL REVISION ==="
             git -C owrt rev-parse HEAD
-            echo "## Kernel config"
-            find owrt/build_dir/target-* -path '*/linux-*/linux-*/.config' -type f -print -quit | while read f; do
+            echo "=== KERNEL CONFIG ==="
+            find owrt/build_dir -path '*/linux-*/linux-*/.config' -type f -print -quit | while read f; do
               grep -E '^CONFIG_(MODVERSIONS|MODULE_REL_CRCS|IKCONFIG|IKCONFIG_PROC)=' "$f" || true
             done
-            echo "## Export records for AWG imports"
-            awk 'NR==FNR {want[$1]=1; next} ($2 in want) {print $2, $1, $3, $4}' work/imports.txt work/Module.symvers | sort -k1,1
-            echo "## Imports absent from Module.symvers"
+            echo "=== EXPORTED SYMBOLS MATCHING AWG IMPORTS ==="
+            awk 'NR==FNR {want[$1]=1; next} ($2 in want) {print $2, $1, $3, $4}' work/imports.txt work/Module.symvers | sort
+            echo "=== IMPORTS MISSING FROM MODULE.SYMVERS ==="
             awk 'NR==FNR {want[$1]=1; next} ($2 in want) {found[$2]=1} END {for (s in want) if (!(s in found)) print s}' work/imports.txt work/Module.symvers | sort
-            echo "## Limitation"
-            echo "This is the upstream OpenWrt build tree with GL vermagic overridden."
-            echo "It is not the original vendor GL.iNet Module.symvers and cannot prove live-kernel ABI compatibility."
-          } | tee work/kernel-symbol-comparison.txt
+            echo "=== ABI LIMITATION ==="
+            echo "This is upstream OpenWrt Module.symvers, not the original GL.iNet vendor Module.symvers."
+            echo "Matching exports here does not prove compatibility with the live vendor kernel."
+          } > work/kernel-symbol-comparison.txt
 
       - name: Upload diagnostics
         uses: actions/upload-artifact@v4
@@ -127,4 +119,3 @@ jobs:
             work/kernel-symbol-comparison.txt
             work/SHA256SUMS.txt
           if-no-files-found: error
-
